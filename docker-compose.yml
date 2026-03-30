@@ -1,0 +1,153 @@
+version: '3.9'
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg15
+    container_name: crawldata-postgres
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-crawldata}
+      POSTGRES_USER: ${POSTGRES_USER:-crawldata}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-crawldata123}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-crawldata}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - crawldata-net
+
+  redis:
+    image: redis:7-alpine
+    container_name: crawldata-redis
+    command: >
+      redis-server
+      --save 900 1
+      --save 300 10
+      --appendonly yes
+      --appendfsync everysec
+      --maxmemory 256mb
+      --maxmemory-policy allkeys-lru
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - crawldata-net
+
+  rabbitmq:
+    image: rabbitmq:3-management-alpine
+    container_name: crawldata-rabbitmq
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-crawldata}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:-crawldata123}
+      RABBITMQ_DEFAULT_VHOST: /
+    ports:
+      - "5672:5672"
+      - "15672:15672"   # Management UI: http://localhost:15672
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "check_port_connectivity"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+    networks:
+      - crawldata-net
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: crawldata-backend
+    environment:
+      SPRING_PROFILES_ACTIVE: docker
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: ${POSTGRES_DB:-crawldata}
+      POSTGRES_USER: ${POSTGRES_USER:-crawldata}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-crawldata123}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: 5672
+      RABBITMQ_USER: ${RABBITMQ_USER:-crawldata}
+      RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:-crawldata123}
+      JWT_SECRET: ${JWT_SECRET:-changeme_use_a_long_random_secret_in_production}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    networks:
+      - crawldata-net
+    restart: unless-stopped
+
+  crawler-worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: crawldata-crawler-worker
+    environment:
+      SPRING_PROFILES_ACTIVE: docker,worker
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: ${POSTGRES_DB:-crawldata}
+      POSTGRES_USER: ${POSTGRES_USER:-crawldata}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-crawldata123}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: 5672
+      RABBITMQ_USER: ${RABBITMQ_USER:-crawldata}
+      RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:-crawldata123}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    networks:
+      - crawldata-net
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        API_URL: ${API_URL:-http://localhost:8080}
+    container_name: crawldata-frontend
+    ports:
+      - "4200:80"
+    depends_on:
+      - backend
+    networks:
+      - crawldata-net
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  redis_data:
+  rabbitmq_data:
+
+networks:
+  crawldata-net:
+    driver: bridge

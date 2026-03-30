@@ -1,0 +1,125 @@
+spring:
+  application:
+    name: crawl-data-backend
+
+  datasource:
+    url: jdbc:postgresql://${POSTGRES_HOST:localhost}:${POSTGRES_PORT:5432}/${POSTGRES_DB:crawldata}
+    username: ${POSTGRES_USER:crawldata}
+    password: ${POSTGRES_PASSWORD:crawldata123}
+    driver-class-name: org.postgresql.Driver
+    hikari:
+      maximum-pool-size: 10
+      minimum-idle: 2
+
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    show-sql: false
+    properties:
+      hibernate:
+        dialect: org.hibernate.dialect.PostgreSQLDialect
+        format_sql: true
+
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+    baseline-on-migrate: true
+
+  rabbitmq:
+    host: ${RABBITMQ_HOST:localhost}
+    port: ${RABBITMQ_PORT:5672}
+    username: ${RABBITMQ_USER:crawldata}
+    password: ${RABBITMQ_PASSWORD:crawldata123}
+    listener:
+      simple:
+        acknowledge-mode: manual
+        prefetch: 5
+        retry:
+          enabled: false   # Handled manually via DLX
+
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+      timeout: 5000ms
+      lettuce:
+        pool:
+          max-active: 8
+          min-idle: 1
+
+  cache:
+    type: redis
+    redis:
+      time-to-live: 1800000   # 30 minutes default
+
+  jackson:
+    serialization:
+      write-dates-as-timestamps: false
+    default-property-inclusion: non_null
+
+app:
+  jwt:
+    secret: ${JWT_SECRET:changeme_use_a_long_random_secret_in_production}
+    expiration-ms: 86400000   # 24 hours
+
+  ai:
+    gemini:
+      api-key: ${GEMINI_API_KEY:}
+      base-url: https://generativelanguage.googleapis.com/v1beta
+      model: gemini-pro
+    openai:
+      api-key: ${OPENAI_API_KEY:}
+      base-url: https://api.openai.com/v1
+      model: gpt-4o-mini
+      embedding-model: text-embedding-3-small
+
+  crawler:
+    user-agent: "CrawlDataBot/1.0 (Vietnamese News Aggregator)"
+    connect-timeout-ms: 10000
+    read-timeout-ms: 15000
+
+  rabbitmq:
+    crawl:
+      exchange: crawl.exchange
+      queue: crawl.job.queue
+      retry-queue: crawl.retry.queue
+      dlq: crawl.dlq
+      routing-key: crawl.source.all
+      retry-ttl-ms: 60000
+      max-retries: 3
+    summarize:
+      exchange: summarize.exchange
+      queue: summarize.job.queue
+      retry-queue: summarize.retry.queue
+      dlq: summarize.dlq
+      routing-key: summarize.article
+      retry-ttl-ms: 30000
+      max-retries: 3
+
+  cache:
+    articles-ttl-minutes: 30
+    search-ttl-minutes: 60
+    dedup-ttl-hours: 24
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics
+  endpoint:
+    health:
+      show-details: when_authorized
+
+springdoc:
+  api-docs:
+    path: /api-docs
+  swagger-ui:
+    path: /swagger-ui.html
+
+logging:
+  level:
+    com.crawldata: INFO
+    com.crawldata.crawler: DEBUG
+    org.springframework.amqp: WARN
+  file:
+    name: logs/crawldata.log

@@ -3,9 +3,9 @@
 ## TL;DR
 Build a distributed news crawling system with:
 - **Hourly updates** from configurable Vietnamese news sites (stored in DB table)
-- **Redis job queue** for scalable crawling (1K-10K articles/day)
+- **RabbitMQ** for async job queue (crawl jobs & summarize jobs, retry, DLQ)
 - **PostgreSQL** for articles, users, categories, search embeddings
-- **Redis duplicate detection** (fast pre-DB checks)
+- **Redis** for cache, duplicate detection, rate limiting (not job queue)
 - **Configurable AI summarization** (interval-based or on-demand via Gemini/OpenAI)
 - **Hybrid search**: Full-text + semantic similarity (pgvector)
 - **Admin dashboard** with crawl monitoring, error alerts, manual controls
@@ -38,15 +38,16 @@ Build a distributed news crawling system with:
 4. **Docker Compose Stack**
    - PostgreSQL 15+ with pgvector extension
    - Redis 7+ (RDB + AOF persistence)
+   - RabbitMQ 3+ with management plugin (port 5672, UI 15672)
    - Spring Boot backend container
    - Angular frontend (Nginx)
-   - Optional: separate crawler worker container
+   - Optional: separate crawler-worker container
 
-5. **Redis Configuration**
+5. **Redis Configuration** (cache + dedup only, not job queue)
    - RDB snapshots every 900s
    - AOF (fsync every second)
    - Maxmemory policy: allkeys-lru (evict oldest accessed keys)
-   - Persist job queue & duplicate cache across restarts
+   - Persist duplicate cache across restarts
 
 ---
 
@@ -82,7 +83,7 @@ Build a distributed news crawling system with:
 ---
 
 ### Phase 3: Configurable Crawler Infrastructure (depends on Phase 1)
-**Goals**: Flexible, database-driven crawler configuration; Redis job queue
+**Goals**: Flexible, database-driven crawler configuration; RabbitMQ message-driven crawling
 
 1. **Crawler Sources Management** (DB-driven)
    - `crawler_sources` table: (id, website_name, base_url, selector_config_json, enabled, retry_limit)
@@ -103,17 +104,19 @@ Build a distributed news crawling system with:
    - Handle edge cases: missing fields, malformed HTML
    - Custom parsers for complex sites (VnExpress, Tuổi Trẻ, etc.)
 
-3. **Redis Job Queue** (replace RabbitMQ/Kafka)
-   - Queue key: `crawl:queue` (Redis List)
-   - Dead letter queue: `crawl:dlq` (failed jobs)
-   - Job payload: `{source_id, url, scheduled_at, retry_count}`
-   - Scheduler runs hourly: fetch enabled sources → push N jobs to queue
+3. **RabbitMQ Job Queue** (crawl orchestration)
+   - Exchange: `crawl.exchange` (topic type)
+   - Queue: `crawl.job.queue` → routing key `crawl.source.*`
+   - Retry queue: `crawl.retry.queue` (x-message-ttl: 60s, reroute to main queue)
+   - Dead letter queue: `crawl.dlq` (after 3 retries → alert)
+   - Job payload: `{source_id, website_name, base_url, scheduled_at, retry_count}`
+   - Scheduler runs hourly: fetch enabled sources → publish to `crawl.exchange`
 
-4. **Crawler Worker** (can be separate process)
-   - Consume from `crawl:queue`
+4. **Crawler Worker** (can be separate Docker service)
+   - `@RabbitListener` on `crawl.job.queue`
    - Execute crawl logic: fetch HTML → parse → extract data
    - Check Redis duplicate cache before saving to DB
-   - Push to DLQ if fail after retries
+   - On failure: nack message → routed to retry → then DLQ
 
 5. **Rate Limiting per Source** (Redis)
    - Counter key: `rate_limit:{source_id}` (incremented per crawl)
@@ -145,9 +148,10 @@ Build a distributed news crawling system with:
 3. **Batch Job Scheduler** (Configurable)
    - @Scheduled task runs every N minutes (configurable: 5, 10, 30, custom)
    - Fetch unsummarized articles (batch size: 10-20)
-   - Call AI API with Vietnamese prompt
+   - Publish each article to RabbitMQ `summarize.job.queue`
+   - Worker processes and calls AI API with Vietnamese prompt
    - Store results: `summaries` table (id, article_id, summary_text, model, tokens_used)
-   - Handle partial failures gracefully
+   - Handle partial failures: retry queue → DLQ after 3 failures
 
 4. **On-Demand Summarization**
    - Endpoint: POST `/api/admin/summarization/trigger`
@@ -398,17 +402,31 @@ CREATE INDEX idx_search_embeddings ON search_embeddings USING ivfflat(embedding 
 
 ---
 
-## Redis Schema
+## RabbitMQ Schema
 
 ```
-# Job Queue
-Key: crawl:queue (List)
-  → Each element: JSON {source_id, url, scheduled_at, retry_count}
+# Crawl Pipeline
+Exchange: crawl.exchange (topic)
+  Queue: crawl.job.queue        → routing key: crawl.source.*
+  Queue: crawl.retry.queue      → TTL 60s, DLX → crawl.exchange
+  Queue: crawl.dlq              → dead-letter (manual review / alerts)
 
-# Dead Letter Queue
-Key: crawl:dlq (List)
-  → Failed jobs for inspection
+# Summarize Pipeline
+Exchange: summarize.exchange (topic)
+  Queue: summarize.job.queue    → routing key: summarize.article
+  Queue: summarize.retry.queue  → TTL 30s, DLX → summarize.exchange
+  Queue: summarize.dlq          → dead-letter (quota exceeded, API error)
 
+# Message Payload Examples
+Crawl job:     {source_id, website_name, base_url, selector_config, retry_count}
+Summarize job: {article_id, title, content, model, max_length}
+```
+
+---
+
+## Redis Schema (cache + dedup only)
+
+```
 # Duplicate Detection (daily rolling)
 Key: crawled_urls:2024-03-25 (Set)
   → Members: hash(source_id||url)
@@ -445,10 +463,11 @@ Key: ai_cost:{date} (Counter)
 
 ## Critical Architecture Decisions
 
-### 1. **Redis as Job Queue** (not RabbitMQ/Kafka)
-- **Pro**: Simpler operations, faster dev cycle, sufficient for 1K-10K articles/day
-- **Con**: Single-node bottleneck (addressed by horizontal scaling + Sentinel)
-- Redis Sentinel for HA in production
+### 1. **RabbitMQ as Job Queue** (not Redis Lists)
+- **Pro**: Native retry, dead-letter, message acknowledgment, management UI
+- **Con**: One more service to operate (addressed by Docker Compose + management UI)
+- Topic exchange for flexible routing by source_id
+- Retry policy: 3 attempts → DLQ → admin alert
 
 ### 2. **Duplicate Detection Strategy**
 - **Fast path**: Check Redis set `crawled_urls:{date}` (< 1ms)
@@ -477,7 +496,8 @@ Key: ai_cost:{date} (Counter)
 | Component | Technology | Rationale |
 |-----------|------------|-----------|
 | Backend API | Spring Boot 3.x | Mature, widely supported |
-| Job Queue | Redis Lists | Simple, sufficient for scale |
+| Job Queue | RabbitMQ 3+ | Reliable async, native retry, DLQ, management UI |
+| Cache + Dedup | Redis 7+ | Fast reads, duplicate fingerprinting, rate limit |
 | Database | PostgreSQL 15+ | Relational + pgvector (semantic search) |
 | Parsing | Jsoup | Good CSS selector support |
 | Frontend | Angular 17+ | Signals for state, TypeScript |
@@ -496,8 +516,9 @@ Key: ai_cost:{date} (Counter)
 - Redis duplicate detection: Mock Redis
 
 ### Integration Tests
-- End-to-end: crawl → Redis duplicate check → save to DB → summarize → retrieve via API
-- Admin endpoints: add/edit crawler source → trigger crawl
+- End-to-end: crawl job published → RabbitMQ consumer → Redis dedup → save to DB → summarize job published → summary saved → retrieve via API
+- RabbitMQ: verify retry queue TTL, DLQ routing after 3 failures
+- Admin endpoints: add/edit crawler source → trigger crawl → verify queue message published
 - Search: index articles → execute full-text query
 - Auth: login → JWT token → authenticated requests
 
@@ -529,7 +550,7 @@ Key: ai_cost:{date} (Counter)
 - ✅ Full-text + semantic search (hybrid)
 - ✅ Export articles (PDF/CSV)
 - ✅ Admin dashboard with crawl monitoring, error alerts, manual controls
-- ✅ Medium-scale distributed architecture (Redis job queue)
+- ✅ Medium-scale distributed architecture (RabbitMQ queue + Redis cache)
 
 **Excluded (Phase 2+)**:
 - ❌ Real-time crawling (hourly is standard for news)
